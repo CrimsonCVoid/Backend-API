@@ -1,57 +1,69 @@
 import express from "express";
 import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
 import { GetSolarDataByCoords } from "./GetGoogleData.js";
+import { convertGoogleToRoofData } from "./ConvertGoogleToRoofData.js";
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ❗ These come from environment variables on the Droplet
-const supabaseUrl = process.env.SUPABASE_URL;
-const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// VPC API key authentication
+const API_KEY = process.env.INTERNAL_API_KEY;
 
-// ✅ This client uses the *service role* key, NEVER sent to the frontend
-// const supabase = createClient(supabaseUrl, serviceRoleKey);
+// Health check — no auth required
+app.get("/health", (req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// // Simple example: secure endpoint that fetches all users
-// app.get("/api/users", async (req, res) => {
-//   const { data, error } = await supabase
-//     .from("users")
-//     .select("*");
+// API key middleware — protects all routes below this point
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  if (API_KEY && req.headers["x-api-key"] !== API_KEY) {
+    console.warn(`[Auth] Rejected request to ${req.path} — invalid API key`);
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+});
 
-//   if (error) {
-//     console.error(error);
-//     return res.status(500).json({ error: "DB error" });
-//   }
+// POST /generate — called by Frontend proxy (/api/roof-generate)
+// Accepts { lat, lng }, fetches Google Solar data, converts to RoofData format
+app.post("/generate", async (req, res) => {
+  const { lat, lng } = req.body;
+  if (lat == null || lng == null) {
+    return res.status(400).json({ error: "lat and lng are required" });
+  }
 
-//   res.json(data);
-// });
+  console.log(`[generate] Processing request for (${lat}, ${lng})`);
 
-// // Example POST
-// app.post("/api/add-user", async (req, res) => {
-//   const { email } = req.body;
-//   const { data, error } = await supabase
-//     .from("users")
-//     .insert({ email })
-//     .select()
-//     .single();
+  try {
+    const googleData = await GetSolarDataByCoords(lat, lng);
+    const roofData = convertGoogleToRoofData(googleData);
+    console.log(`[generate] Success — total_area_sf: ${roofData.total_area_sf}, planes: ${roofData.planes.length}`);
+    res.json(roofData);
+  } catch (err) {
+    console.error("[generate] Failed:", err);
+    res.status(500).json({ error: err.message || "Generation failed" });
+  }
+});
 
-//   if (error) {
-//     console.error(error);
-//     return res.status(400).json({ error: error.message });
-//   }
-
-//   res.json(data);
-// });
-
+// Legacy route — kept for backward compatibility
 app.get("/api/getroofbycoords", async (req, res) => {
-    console.log("Request???");
+  console.log("[getroofbycoords] Request received");
+  try {
     let DATA = await GetSolarDataByCoords(req.query.lat, req.query.lon);
     res.status(200).json(DATA);
-})
+  } catch (err) {
+    console.error("[getroofbycoords] Failed:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch roof data" });
+  }
+});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Backend listening on port ${PORT}`);
+// Bind to VPC private IP (10.108.0.3) on port 4000
+const PRIVATE_IP = process.env.PRIVATE_IP || "0.0.0.0";
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, PRIVATE_IP, () => {
+  console.log(`Algorithm API listening on ${PRIVATE_IP}:${PORT}`);
+  if (API_KEY) {
+    console.log("[Auth] API key authentication enabled");
+  } else {
+    console.warn("[Auth] WARNING: No INTERNAL_API_KEY set — endpoints are unprotected");
+  }
 });
